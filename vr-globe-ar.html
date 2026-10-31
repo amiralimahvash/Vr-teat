@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>کره زمین در دنیای واقعی</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif;color:#eef3ff}
+  canvas{display:block;width:100%;height:100%}
+  #ui{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:#02060ee6;text-align:center;padding:24px}
+  #ui h1{margin:0;font-size:26px}
+  #ui p{margin:0;max-width:340px;line-height:1.8;font-size:14px;color:#a9b6d6}
+  button{font:inherit;font-size:16px;padding:12px 26px;border-radius:999px;border:0;background:#3fa7ff;color:#02101f;font-weight:700}
+  #bar{position:fixed;top:8px;left:50%;transform:translateX(-50%);display:none;gap:6px;opacity:.55}
+  #bar button{padding:6px 12px;font-size:12px;background:#ffffff33;color:#fff}
+  #msg{position:fixed;bottom:8px;width:100%;text-align:center;font-size:12px;color:#cfe0ff;pointer-events:none;text-shadow:0 0 4px #000}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <h1>کره زمین در دنیای واقعی</h1>
+  <p>تصویر دوربین پشت گوشی پس‌زمینه است و زمین جلوی تو شناور می‌ماند. سرت را بچرخان تا دورش بگردی.<br>یک دست: شست و اشاره را بچسبان و حرکت بده تا بچرخد.<br>دو دست: هر دو را چسبان کن و از هم دور یا نزدیک کن تا زوم شود.</p>
+  <button id="start">شروع</button>
+  <p id="err" style="color:#ff9a9a"></p>
+</div>
+<div id="bar">
+  <button id="vr">VR / تک‌صفحه</button>
+  <button id="gyro">ژیروسکوپ</button>
+  <button id="ctr">مرکز</button>
+  <button id="cam">دوربین</button>
+</div>
+<div id="msg"></div>
+<video id="v" playsinline muted style="display:none"></video>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const canvas = $('c'), video = $('v'), msg = $('msg');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+
+// ---- Earth (anchored in the room) ----
+const loader = new THREE.TextureLoader(); loader.setCrossOrigin('anonymous');
+const base = 'https://raw.githubusercontent.com/mrdoob/three.js/r128/examples/textures/planets/';
+const earthMat = new THREE.MeshPhongMaterial({color:0x2a6fb0, shininess:14});
+loader.load(base+'earth_atmos_2048.jpg', t=>{ earthMat.map=t; earthMat.color.set(0xffffff); earthMat.needsUpdate=true; });
+loader.load(base+'earth_specular_2048.jpg', t=>{ earthMat.specularMap=t; earthMat.needsUpdate=true; });
+const globe = new THREE.Mesh(new THREE.SphereGeometry(1,64,64), earthMat);
+globe.rotation.z = 0.41; globe.position.set(0, 0, -3.2);
+scene.add(globe);
+scene.add(new THREE.AmbientLight(0x8899bb, 0.8));
+const sun = new THREE.DirectionalLight(0xffffff, 1.3); sun.position.set(4,2,2); scene.add(sun);
+
+// ---- Rig: cameras follow the phone's gyro ----
+const FOV = 75, D = 10;
+const rig = new THREE.Group(); scene.add(rig);
+const camL = new THREE.PerspectiveCamera(FOV,1,0.1,100), camR = camL.clone();
+camL.position.x = -0.032; camR.position.x = 0.032;
+rig.add(camL, camR);
+
+// ---- Camera video as background, attached to each eye ----
+const vtex = new THREE.VideoTexture(video);
+vtex.minFilter = THREE.LinearFilter; vtex.generateMipmaps = false;
+const vmat = new THREE.MeshBasicMaterial({map:vtex, depthTest:false, depthWrite:false, toneMapped:false});
+function mkPlane(cam){ const m = new THREE.Mesh(new THREE.PlaneGeometry(1,1), vmat); m.position.z=-D; m.renderOrder=-10; m.frustumCulled=false; cam.add(m); return m; }
+const planeL = mkPlane(camL), planeR = mkPlane(camR);
+let planeW = 1, planeH = 1;
+function layoutVideo(cam, plane){
+  const H = 2*D*Math.tan(THREE.MathUtils.degToRad(FOV/2)), W = H*cam.aspect;
+  const va = (video.videoWidth||4)/(video.videoHeight||3);
+  if(va > cam.aspect){ planeH = H; planeW = H*va; } else { planeW = W; planeH = W/va; }
+  plane.scale.set(planeW, planeH, 1);
+}
+
+// ---- Hand cursors ----
+const markers = [0,1].map(()=>{ const m=new THREE.Mesh(new THREE.SphereGeometry(0.03,16,16), new THREE.MeshBasicMaterial({color:0xffd34d, depthTest:false})); m.renderOrder=5; m.visible=false; rig.add(m); return m; });
+let handPts = [];
+function placeMarkers(){
+  markers.forEach((m,i)=>{
+    const h = handPts[i]; m.visible = !!h; if(!h) return;
+    const k = 1.5/D;
+    m.position.set((h.p.x-0.5)*planeW*k, (0.5-h.p.y)*planeH*k, -1.5);
+    m.material.color.set(h.pinch ? 0x4dff9a : 0xffd34d);
+  });
+}
+
+// ---- Gyroscope ----
+let devQ = null, yawQ = new THREE.Quaternion(), needCenter = true;
+const Z = new THREE.Vector3(0,0,1), Y = new THREE.Vector3(0,1,0);
+const q1 = new THREE.Quaternion(-Math.sqrt(0.5),0,0,Math.sqrt(0.5));
+function onOrient(e){
+  if(e.alpha==null) return;
+  const d = THREE.MathUtils.degToRad;
+  const orient = d((screen.orientation && screen.orientation.angle) || window.orientation || 0);
+  const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(d(e.beta), d(e.alpha), -d(e.gamma), 'YXZ'));
+  q.multiply(q1); q.multiply(new THREE.Quaternion().setFromAxisAngle(Z, -orient));
+  devQ = q;
+}
+function recenter(){ if(!devQ) return; const e = new THREE.Euler().setFromQuaternion(devQ,'YXZ'); yawQ.setFromAxisAngle(Y, -e.y); needCenter = false; }
+let gyroOn = false;
+async function enableGyro(){
+  try{
+    // iOS 13+: must be called directly from a tap
+    if(typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'){
+      const r = await DeviceOrientationEvent.requestPermission();
+      if(r !== 'granted'){ msg.textContent = 'اجازه‌ی ژیروسکوپ رد شد. Safari را کامل ببند و دوباره باز کن، یا از تنظیمات سایت اجازه بده.'; return false; }
+    }
+    if(!gyroOn){ addEventListener('deviceorientation', onOrient, true); gyroOn = true; }
+    return true;
+  }catch(e){ msg.textContent = 'ژیروسکوپ: ' + e.message; return false; }
+}
+$('gyro').onclick = async ()=>{ if(await enableGyro()) setTimeout(()=>{ if(!devQ) msg.textContent='سنسور داده‌ای نمی‌فرستد (HTTPS و اجازه‌ی Motion را چک کن)'; else { msg.textContent=''; needCenter=true; } }, 700); };
+
+// ---- Hand logic ----
+let zoom=1, zoomTarget=1, velX=0, velY=0, prevOne=null, zoomStart=null, zoomBase=1;
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+function handInfo(lm){
+  const size = dist(lm[0],lm[9]) || 0.1;
+  return {pinch: dist(lm[4],lm[8])/size < 0.45, p:{x:(lm[4].x+lm[8].x)/2, y:(lm[4].y+lm[8].y)/2}};
+}
+function processHands(res){
+  const hands = (res.landmarks||[]).map(handInfo).slice(0,2);
+  handPts = hands;
+  if(hands.length===2 && hands[0].pinch && hands[1].pinch){
+    const d = dist(hands[0].p, hands[1].p);
+    if(zoomStart===null){ zoomStart=d; zoomBase=zoomTarget; }
+    zoomTarget = Math.min(3, Math.max(0.4, zoomBase*d/zoomStart));
+    prevOne=null; msg.textContent='زوم';
+  } else {
+    zoomStart=null;
+    if(hands.length===1 && hands[0].pinch){
+      const p=hands[0].p;
+      if(prevOne){ velY=(p.x-prevOne.x)*6; velX=(p.y-prevOne.y)*4; }
+      prevOne=p; msg.textContent='چرخش';
+    } else { prevOne=null; msg.textContent = hands.length ? 'شست و اشاره را بچسبان' : ''; }
+  }
+}
+
+// ---- Render ----
+let vrMode=true, landmarker, lastT=-1, frame=0;
+function resize(){ renderer.setSize(innerWidth, innerHeight, false); }
+addEventListener('resize', resize); resize();
+
+function drawEye(cam, plane, x, w, h){
+  cam.aspect = w/h; cam.updateProjectionMatrix();
+  layoutVideo(cam, plane); placeMarkers();
+  renderer.setViewport(x,0,w,h); renderer.setScissor(x,0,w,h); renderer.render(scene, cam);
+}
+function render(){
+  requestAnimationFrame(render); frame++;
+  if(video.readyState>=2) vtex.needsUpdate = true;
+  if(landmarker && video.readyState>=2 && video.currentTime!==lastT && frame%2===0){
+    lastT = video.currentTime;
+    try{ processHands(landmarker.detectForVideo(video, performance.now())); }catch(e){}
+  }
+  if(devQ){ if(needCenter) recenter(); rig.quaternion.copy(yawQ).multiply(devQ); }
+  globe.rotation.y += velY; globe.rotation.x = Math.max(-1.2, Math.min(1.2, globe.rotation.x+velX));
+  velY*=0.88; velX*=0.88;
+  zoom += (zoomTarget-zoom)*0.15; globe.scale.setScalar(zoom);
+
+  const w=innerWidth, h=innerHeight;
+  renderer.setScissorTest(true);
+  if(vrMode){
+    drawEye(camL, planeL, 0, w/2, h);
+    drawEye(camR, planeR, w/2, w/2, h);
+  } else {
+    camL.position.x = 0; drawEye(camL, planeL, 0, w, h); camL.position.x = -0.032;
+  }
+}
+
+// ---- Camera (tries ultra-wide) ----
+let backCams=[], camIdx=0;
+async function openCam(deviceId){
+  if(video.srcObject) video.srcObject.getTracks().forEach(t=>t.stop());
+  const v = deviceId ? {deviceId:{exact:deviceId}} : {facingMode:{ideal:'environment'}};
+  const stream = await navigator.mediaDevices.getUserMedia({video:{...v, width:{ideal:1280}, height:{ideal:720}}, audio:false});
+  video.srcObject = stream; await video.play();
+  try{
+    const tr = stream.getVideoTracks()[0], cap = tr.getCapabilities();
+    if(cap.zoom) await tr.applyConstraints({advanced:[{zoom:cap.zoom.min}]});
+  }catch(e){}
+}
+async function pickWide(){
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput');
+  backCams = devs.filter(d=>/back|rear|environment|ultra|wide/i.test(d.label) && !/front|user/i.test(d.label));
+  const i = backCams.findIndex(d=>/ultra/i.test(d.label));
+  if(i>=0){ camIdx=i; await openCam(backCams[i].deviceId); }
+}
+$('cam').onclick = async ()=>{ if(backCams.length<2) return; camIdx=(camIdx+1)%backCams.length; try{ await openCam(backCams[camIdx].deviceId); }catch(e){} };
+$('vr').onclick = ()=>{ vrMode=!vrMode; };
+$('ctr').onclick = recenter;
+
+$('start').onclick = async ()=>{
+  const err=$('err'); err.textContent='';
+  try{
+    await enableGyro();   // first call, directly inside the tap (needed on iPhone)
+    await openCam(null);
+    await pickWide();
+    const fs = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+    landmarker = await HandLandmarker.createFromOptions(fs,{
+      baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task', delegate:'GPU'},
+      runningMode:'VIDEO', numHands:2
+    });
+    $('ui').style.display='none'; $('bar').style.display='flex';
+    try{ await document.documentElement.requestFullscreen(); await screen.orientation.lock('landscape'); }catch(e){}
+    setTimeout(()=>{ needCenter=true; if(!devQ) msg.textContent='ژیروسکوپ فعال نشد؛ دکمه‌ی «ژیروسکوپ» را بزن'; }, 1200);
+  }catch(e){ err.textContent='خطا: '+e.message+' (صفحه باید با HTTPS باز شود و اجازه‌ی دوربین و سنسورها را بدهید)'; }
+};
+render();
+</script>
+</body>
+</html>
